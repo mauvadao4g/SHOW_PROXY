@@ -1,54 +1,59 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CAPTURE_DIR="$DIR/captures"
+CERT_DIR="$DIR/certs"
 mkdir -p "$CAPTURE_DIR"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-HOST_IP="$(hostname -I | awk '{print $1}')"
+HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[ -z "$HOST_IP" ] && HOST_IP="$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)"
+
+IS_TERMUX=0
+if [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ]; then
+  IS_TERMUX=1
+fi
 
 PORT=8080
-FILTER=""
+FILTER_DOMAIN=""
+FILTER_METHOD=""
 SAVE_FILE=""
 REPLAY_FILE=""
 MODE="dump"     # dump | tui | web
 VERBOSE=0
-DETAIL=""
+DETAIL=0
+NO_INTERCEPT=0
+NO_AUTOCONFIG=0
 EXPORT_TXT=""
 EXPORT_HAR=""
 
 usage() {
   cat <<EOF
-Uso: $(basename "$0") [opções]
+Uso: $(basename "$0") [opcoes]
 
 Captura ao vivo (escuta o proxy em 0.0.0.0:PORT):
   -p PORT         porta do proxy (default: 8080)
-  -w FILE         salva a captura em FILE (default: captures/capture-<timestamp>.flow)
-  -f FILTER       filtro de exibição, ex: -f "~d api.seuapp.com"
-  -v              verbose: headers completos (mitmdump -v)
-  -b              bem detalhado: headers + body (flow_detail=3)
-  -t              interface TUI interativa (mitmproxy) em vez do stream
-  -W              interface web (mitmweb) em vez do stream
+  -w FILE         salva a captura em FILE (default: captures/capture-<timestamp>.jsonl no
+                  Termux, .flow no Linux)
+  -f DOMINIO      so grava/mostra requests cujo host contenha DOMINIO (substring)
+  -m METODO       so grava/mostra requests desse metodo HTTP (GET, POST, ...) [so Termux]
+  -v              verbose: mostra headers ao vivo
+  -b              bem detalhado: headers + body ao vivo
+  -n              desativa interceptacao TLS (so repassa HTTPS, sem decifrar) [so Termux]
+  -C              nao configura o proxy do sistema automaticamente (com root) [so Termux]
+  -t              interface TUI interativa (mitmproxy) [so fora do Termux]
+  -W              interface web: mitmweb fora do Termux; dashboard de conexoes no Termux
 
-Reabrindo/exportando captura já salva (não escuta proxy):
-  -r FILE         reabre FILE (.flow) interativo (mitmproxy -r); combine com -W
-                  pra abrir na web (mitmweb -r) em vez do TUI
-  -x FILE         exporta FILE (.flow) pra texto legível (dump.txt) e sai
-  --har FILE      exporta FILE (.flow) pra .har (formato JSON padrão) e sai
+Reabrindo/exportando captura ja salva (nao escuta proxy):
+  -r FILE         mostra o conteudo de FILE formatado no terminal
+  -x FILE         exporta FILE pra texto legivel (captures/dump-<timestamp>.txt)
+  --har FILE      exporta FILE pra .har (formato JSON padrao)
 
   -h              mostra esta ajuda
 
-Exemplos:
-  $(basename "$0")                                # ao vivo, stream simples
-  $(basename "$0") -w captures/capture.flow        # ao vivo, salvando em arquivo fixo
-  $(basename "$0") -f "~d api.seuapp.com"          # só requests desse domínio
-  $(basename "$0") -v                              # headers completos
-  $(basename "$0") -b                               # headers + body
-  $(basename "$0") -t                               # TUI interativo ao vivo
-  $(basename "$0") -r captures/capture.flow         # reabre salvo, interativo
-  $(basename "$0") -r captures/capture.flow -W      # reabre salvo, na web
-  $(basename "$0") -x captures/capture.flow         # exporta salvo pra dump.txt
-  $(basename "$0") --har captures/capture.flow      # exporta salvo pra .har
+No Termux, o certificado da CA fica em certs/ca-cert.pem (gerado pelo install.sh) e e'
+servido automaticamente em http://<ip>:PORT/ca-cert.pem enquanto o proxy estiver rodando.
+Se tiver root, o proxy do SISTEMA (settings global http_proxy) e' configurado sozinho ao
+subir e desfeito ao sair (Ctrl+C) - use -C pra desativar isso e configurar manualmente.
 EOF
 }
 
@@ -56,30 +61,121 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -p) PORT="$2"; shift 2;;
     -w) SAVE_FILE="$2"; shift 2;;
-    -f) FILTER="$2"; shift 2;;
-    -v) VERBOSE=1; shift;;
-    -b) DETAIL=3; shift;;
+    -f) FILTER_DOMAIN="$2"; shift 2;;
+    -m) FILTER_METHOD="$2"; shift 2;;
+    -v) VERBOSE=1; DETAIL=1; shift;;
+    -b) DETAIL=2; shift;;
+    -n) NO_INTERCEPT=1; shift;;
+    -C) NO_AUTOCONFIG=1; shift;;
     -t) MODE="tui"; shift;;
     -W) MODE="web"; shift;;
     -r) REPLAY_FILE="$2"; shift 2;;
     -x) EXPORT_TXT="$2"; shift 2;;
     --har) EXPORT_HAR="$2"; shift 2;;
     -h|--help) usage; exit 0;;
-    *) echo "Opção desconhecida: $1" >&2; usage; exit 1;;
+    *) echo "Opcao desconhecida: $1" >&2; usage; exit 1;;
   esac
 done
 
-# --- exportar .flow salvo para texto ---
+# ---------------------------------------------------------------------------
+# Modo Termux (proxy.py)
+# ---------------------------------------------------------------------------
+if [ "$IS_TERMUX" = "1" ]; then
+  EXPORTER="$DIR/tools/export_capture.py"
+
+  if [ -n "$EXPORT_TXT" ]; then
+    OUT="$CAPTURE_DIR/dump-$TIMESTAMP.txt"
+    python3 "$EXPORTER" "$EXPORT_TXT" --txt "$OUT"
+    exit $?
+  fi
+
+  if [ -n "$EXPORT_HAR" ]; then
+    OUT="${EXPORT_HAR%.jsonl}.har"
+    python3 "$EXPORTER" "$EXPORT_HAR" --har "$OUT"
+    exit $?
+  fi
+
+  if [ -n "$REPLAY_FILE" ]; then
+    python3 "$EXPORTER" "$REPLAY_FILE" | less -R 2>/dev/null || python3 "$EXPORTER" "$REPLAY_FILE"
+    exit $?
+  fi
+
+  [ -z "$SAVE_FILE" ] && SAVE_FILE="$CAPTURE_DIR/capture-$TIMESTAMP.jsonl"
+
+  export PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}"
+  FLAGS=(--hostname 0.0.0.0 --port "$PORT" --plugins plugins.capture_plugin.CapturePlugin)
+
+  if [ "$NO_INTERCEPT" = "0" ]; then
+    if [ ! -f "$CERT_DIR/ca-cert.pem" ]; then
+      echo "[erro] certs/ca-cert.pem nao existe. Rode ./install.sh primeiro (ou use -n pra desativar a interceptacao)." >&2
+      exit 1
+    fi
+    CAFILE="$(python3 -c 'import certifi; print(certifi.where())' 2>/dev/null)"
+    if [ -z "$CAFILE" ]; then
+      echo "[erro] modulo 'certifi' nao encontrado (pip install --user certifi). Rode ./install.sh." >&2
+      exit 1
+    fi
+    mkdir -p "$CERT_DIR/generated"
+    FLAGS+=(
+      --ca-key-file "$CERT_DIR/ca-key.pem"
+      --ca-cert-file "$CERT_DIR/ca-cert.pem"
+      --ca-signing-key-file "$CERT_DIR/ca-signing-key.pem"
+      --ca-cert-dir "$CERT_DIR/generated"
+      --ca-file "$CAFILE"
+      --enable-static-server --static-server-dir "$CERT_DIR"
+    )
+  fi
+
+  [ "$MODE" = "web" ] && FLAGS+=(--enable-dashboard)
+  if [ "$MODE" = "tui" ]; then
+    echo "[aviso] -t (TUI interativa) nao existe no modo Termux/proxy.py; ignorando." >&2
+  fi
+
+  export CAPTURE_FILE="$SAVE_FILE"
+  export CAPTURE_FILTER_DOMAIN="$FILTER_DOMAIN"
+  export CAPTURE_FILTER_METHOD="$FILTER_METHOD"
+  export CAPTURE_DETAIL="$DETAIL"
+
+  echo "=================================================="
+  echo " Proxy (aponte o celular pra ca): $HOST_IP:$PORT"
+  echo " Salvando captura em: $SAVE_FILE"
+  [ -n "$FILTER_DOMAIN" ] && echo " Filtro de dominio: $FILTER_DOMAIN"
+  [ -n "$FILTER_METHOD" ] && echo " Filtro de metodo: $FILTER_METHOD"
+  if [ "$NO_INTERCEPT" = "0" ]; then
+    echo " Certificado CA: http://$HOST_IP:$PORT/ca-cert.pem (baixe PELO CELULAR com o proxy ja ativo)"
+  else
+    echo " Interceptacao TLS DESATIVADA (-n): HTTPS so' passa, sem decifrar"
+  fi
+  [ "$MODE" = "web" ] && echo " Dashboard: http://$HOST_IP:$PORT/dashboard"
+
+  AUTOCONFIGURED=0
+  if [ "$NO_AUTOCONFIG" = "0" ] && command -v su >/dev/null 2>&1 && su -c true 2>/dev/null; then
+    if bash "$DIR/configure.sh" set "$PORT" >/dev/null 2>&1; then
+      AUTOCONFIGURED=1
+      echo " Proxy do sistema configurado automaticamente (sera desfeito ao sair)"
+      trap 'bash "$DIR/configure.sh" unset >/dev/null 2>&1' EXIT INT TERM
+    fi
+  fi
+  [ "$AUTOCONFIGURED" = "0" ] && echo " Configure o proxy manualmente: Wi-Fi > Modificar rede > Proxy Manual > $HOST_IP:$PORT"
+  echo "=================================================="
+
+  python3 -m proxy "${FLAGS[@]}"
+  exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Modo Linux (mitmproxy) - comportamento original do projeto
+# ---------------------------------------------------------------------------
+FILTER="$FILTER_DOMAIN"
+
 if [ -n "$EXPORT_TXT" ]; then
   OUT="$CAPTURE_DIR/dump-$TIMESTAMP.txt"
   echo "Exportando '$EXPORT_TXT' -> '$OUT' (headers + body)..."
-  # mitmdump -nr às vezes sai com código != 0 mesmo após escrever tudo certo; ignora.
   mitmdump -nr "$EXPORT_TXT" --set flow_detail=3 > "$OUT" || true
   echo "Pronto: $OUT"
   exit 0
 fi
 
-# --- exportar .flow salvo para .har ---
 if [ -n "$EXPORT_HAR" ]; then
   OUT="${EXPORT_HAR%.flow}.har"
   echo "Exportando '$EXPORT_HAR' -> '$OUT'..."
@@ -88,7 +184,6 @@ if [ -n "$EXPORT_HAR" ]; then
   exit 0
 fi
 
-# --- reabrir .flow salvo (interativo ou web) ---
 if [ -n "$REPLAY_FILE" ]; then
   if [ "$MODE" = "web" ]; then
     echo "Reabrindo '$REPLAY_FILE' na interface web (http://localhost:8081)..."
@@ -98,18 +193,17 @@ if [ -n "$REPLAY_FILE" ]; then
   fi
 fi
 
-# --- captura ao vivo ---
 [ -z "$SAVE_FILE" ] && SAVE_FILE="$CAPTURE_DIR/capture-$TIMESTAMP.flow"
 FLAGS=(--listen-host 0.0.0.0 --listen-port "$PORT" -w "$SAVE_FILE")
-[ -n "$DETAIL" ] && FLAGS+=(--set "flow_detail=$DETAIL")
+[ "$DETAIL" != "0" ] && FLAGS+=(--set "flow_detail=$DETAIL")
 [ "$VERBOSE" = "1" ] && FLAGS+=(-v)
 [ -n "$FILTER" ] && FLAGS+=("$FILTER")
 
 echo "=================================================="
-echo " Proxy (aponte o celular pra cá): $HOST_IP:$PORT"
+echo " Proxy (aponte o celular pra ca): $HOST_IP:$PORT"
 echo " Salvando captura em: $SAVE_FILE"
 [ -n "$FILTER" ] && echo " Filtro ativo: $FILTER"
-echo " Certificado CA: acesse http://mitm.it PELO CELULAR (com o proxy já ativo)"
+echo " Certificado CA: acesse http://mitm.it PELO CELULAR (com o proxy ja ativo)"
 echo "=================================================="
 
 case "$MODE" in

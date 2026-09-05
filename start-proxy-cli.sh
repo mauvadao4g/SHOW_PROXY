@@ -1,36 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PORT="${PORT:-8080}"
-FILTER="${FILTER:-}"       # ex: FILTER="~d api.seuapp.com" ./start-proxy-cli.sh
-DETAIL="${DETAIL:-2}"      # 0=quieto 1=curto 2=headers 3=headers+body
-CAPTURE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/captures"
-mkdir -p "$CAPTURE_DIR"
+FILTER="${FILTER:-}"       # ex: FILTER="api.seuapp.com" ./start-proxy-cli.sh
+DETAIL="${DETAIL:-1}"      # 0=so' access log, 1=+headers, 2=+headers+body
 
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-FLOW_FILE="$CAPTURE_DIR/capture-$TIMESTAMP.flow"
-LOG_FILE="$CAPTURE_DIR/capture-$TIMESTAMP.log"
+ARGS=(-p "$PORT")
+[ -n "$FILTER" ] && ARGS+=(-f "$FILTER")
+case "$DETAIL" in
+  2) ARGS+=(-b);;
+  1) ARGS+=(-v);;
+esac
 
-HOST_IP="$(hostname -I | awk '{print $1}')"
-
-echo "=================================================="
-echo " mitmdump iniciando"
-echo "  Proxy (aponte o celular pra cá): $HOST_IP:$PORT"
-echo "  Gravando .flow (reabrir com 'mitmproxy -r'): $FLOW_FILE"
-echo "  Log de texto (headers+body): $LOG_FILE"
-if [ -n "$FILTER" ]; then echo "  Filtro ativo: $FILTER"; fi
-echo "  Certificado CA: acesse http://mitm.it PELO CELULAR (com o proxy já ativo)"
-echo "=================================================="
-
-CMD=(mitmdump
-  --listen-host 0.0.0.0
-  --listen-port "$PORT"
-  --set "flow_detail=$DETAIL"
-  -w "$FLOW_FILE"
-)
-
-if [ -n "$FILTER" ]; then
-  CMD+=("$FILTER")
-fi
-
-"${CMD[@]}" | tee "$LOG_FILE"
+# Atalho pra rodar em modo stream de texto com variaveis de ambiente em vez de flags.
+exec bash "$DIR/proxy_view.sh" "${ARGS[@]}"

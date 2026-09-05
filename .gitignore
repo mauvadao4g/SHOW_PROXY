@@ -1,1 +1,9 @@
 captures/
+certs/
+.proxy_state
+__pycache__/
+*.pyc
+
+# logs de runtime (podem conter tokens/credenciais capturados no tráfego)
+*.log
+proxy_run.log
