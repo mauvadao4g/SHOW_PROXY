@@ -6,8 +6,22 @@
 
 clear
 
+# Pegando o username automaticamente.
+GH_USERNAME=$(ssh -T git@github.com 2>&1 | grep -oP 'Hi \K[^!]+' || gh api user --jq .login)
+[[ -n "$GH_USERNAME" ]] && {
+GITHUB_USER="$GH_USERNAME"
+} || {
 GITHUB_USER="mauvadao4g"
-REPO_NAME="SHOW_PROXY"
+}
+
+BASE="$(basename "$(pwd)")"
+[[ -n "$BASE" ]] && {
+REPO_NAME="$BASE"
+} || {
+echo -e  "\e[1;31mNome Do Repositorio Vazio\e[0m"
+exit 0
+}
+
 REMOTE_URL="git@github.com:${GITHUB_USER}/${REPO_NAME}.git"
 BRANCH="main"
 
